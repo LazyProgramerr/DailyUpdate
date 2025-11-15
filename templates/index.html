@@ -1,18 +1,53 @@
 <!DOCTYPE html>
 <html>
-    <head>
-        <meta charset="utf-8">
-        <meta http-equiv="X-UA-Compatible" content="IE=edge">
-        <title>Daily Updates</title>
-        <meta name="description" content=" updates you daily with whats happening around you">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <link rel="stylesheet" href="static/css/base.css">
-    </head>
-    <body>
-        
-        <h1>Welcome to Daily Updates</h1>
-        <p>Your daily source of news and updates.</p>
+<head>
+    <title>DailyUpdate Backend Tester</title>
+    <style>
+        body { font-family: Arial; padding:20px; }
+        input { padding:8px; width:250px; margin-bottom:10px; }
+        button { padding:10px 20px; }
+        pre { background:#111;color:#0f0;padding:15px;border-radius:8px; }
+        .box { background:#f5f5f5;padding:20px;margin-bottom:40px;border-radius:8px; }
+    </style>
+    <script>
+        async function runTest(route, formId, outputId){
+            const fd = new FormData(document.getElementById(formId));
+            const res = await fetch(route, { method:"POST", body:fd });
+            const json = await res.json();
+            document.getElementById(outputId).textContent = JSON.stringify(json,null,4);
+        }
+    </script>
+</head>
+<body>
 
-        
-    </body>
+<h1>DailyUpdate Backend Testing Interface</h1>
+
+<div class="box">
+    <h3>/sync Test</h3>
+    <form id="syncForm">
+        <input name="user_id" placeholder="user123" required>
+    </form>
+    <button onclick="runTest('/test/sync','syncForm','syncOut')">Run /sync</button>
+    <pre id="syncOut"></pre>
+</div>
+
+<div class="box">
+    <h3>/news Test</h3>
+    <form id="newsForm">
+        <input name="user_id" placeholder="user123" required><br>
+        <input name="lat" placeholder="17.3850" required><br>
+        <input name="lon" placeholder="78.4867" required><br>
+    </form>
+    <button onclick="runTest('/test/news','newsForm','newsOut')">Run /news</button>
+    <pre id="newsOut"></pre>
+</div>
+
+<div class="box">
+    <h3>/cron Test</h3>
+    <form id="cronForm"></form>
+    <button onclick="runTest('/test/cron','cronForm','cronOut')">Run Cron</button>
+    <pre id="cronOut"></pre>
+</div>
+
+</body>
 </html>

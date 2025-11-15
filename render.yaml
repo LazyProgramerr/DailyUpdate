@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: dailyupdate-backend
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn flask_app:app
+    autoDeploy: true
+
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: APPCOMMONKEY_B64
+        sync: false
+      - key: CRON_SECRET
+        sync: false
+      - key: FIREBASE_CREDENTIALS_JSON
+        sync: false
+      - key: FIREBASE_ENABLED
+        value: "0"
+      - key: GEMINI_ENABLED
+        value: "1"
+      - key: NEWS_ENABLED
+        value: "1"
+      - key: CRON_PUSH_ENABLED
+        value: "0"
+      - key: CITY_DETECT_ENABLED
+        value: "1"
+      - key: CACHE_TTL_SECONDS
+        value: "1800"

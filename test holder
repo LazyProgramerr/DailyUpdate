@@ -1,0 +1,529 @@
+# flask_app.py
+import os
+import base64
+import json
+import time
+import traceback
+import hashlib
+from dotenv import load_dotenv
+from datetime import datetime, timezone
+
+from flask import Flask, request, jsonify,render_template
+import requests
+import feedparser
+from geopy.geocoders import Nominatim
+
+from Crypto.Cipher import AES
+from Crypto.Random import get_random_bytes
+
+import google.generativeai as genai
+
+import firebase_admin
+from firebase_admin import credentials, messaging
+
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, UniqueConstraint
+from sqlalchemy.orm import declarative_base, sessionmaker
+
+# -----------------------
+# CONFIG (ENV)
+# -----------------------
+
+load_dotenv()  # take environment variables from .env file
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+APPCOMMONKEY_B64 = os.getenv("APPCOMMONKEY_B64")  # base64-encoded 32 bytes
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./users.db")
+FIREBASE_CREDENTIALS_JSON = os.getenv("FIREBASE_CREDENTIALS_JSON")  # base64 JSON or path
+CRON_SECRET = os.getenv("CRON_SECRET", "CHANGE_THIS_SECRET")
+CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", 30 * 60))  # default 30 minutes
+
+if not GEMINI_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY is required")
+if not APPCOMMONKEY_B64:
+    raise RuntimeError("APPCOMMONKEY_B64 is required")
+
+# decode app common key bytes
+try:
+    APPCOMMON_KEY_BYTES = base64.b64decode(APPCOMMONKEY_B64)
+    if len(APPCOMMON_KEY_BYTES) != 32:
+        raise ValueError("APPCOMMONKEY_B64 must decode to 32 bytes")
+except Exception as e:
+    raise RuntimeError("Invalid APPCOMMONKEY_B64: " + str(e))
+
+# configure Gemini
+genai.configure(api_key=GEMINI_API_KEY)
+
+# -----------------------
+# Firebase Admin init
+# -----------------------
+def init_firebase():
+     # Firebase disabled intentionally
+    if os.getenv("FIREBASE_ENABLED", "0") == "0":
+        print("⚠ Firebase disabled for local/testing mode.")
+        return
+    try:
+        if FIREBASE_CREDENTIALS_JSON:
+            # try treat as base64-encoded JSON or raw JSON
+            s = FIREBASE_CREDENTIALS_JSON.strip()
+            try:
+                # base64 case
+                if not s.startswith("{"):
+                    raw = base64.b64decode(s).decode("utf-8")
+                else:
+                    raw = s
+                cred_json = json.loads(raw)
+                cred = credentials.Certificate(cred_json)
+            except Exception:
+                # fallback: treat as path
+                cred = credentials.Certificate(FIREBASE_CREDENTIALS_JSON)
+        else:
+            cred = None
+
+        if not firebase_admin._apps:
+            if cred:
+                firebase_admin.initialize_app(cred)
+            else:
+                firebase_admin.initialize_app()
+    except Exception as e:
+        print("Firebase init error:", e)
+        raise
+
+init_firebase()
+
+# -----------------------
+# DB (SQLAlchemy)
+# -----------------------
+engine = create_engine(DATABASE_URL, echo=False, future=True)
+Base = declarative_base()
+SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(String(200), unique=True, nullable=False, index=True)
+    aes_key_b64 = Column(String(100), nullable=False)  # user's AES key (base64 32 bytes)
+    device_id = Column(String(200), nullable=True)
+    device_token = Column(String(1024), nullable=True)
+    name = Column(String(200), nullable=True)
+    language = Column(String(20), nullable=True)
+    city = Column(String(200), nullable=True)  # detected from /news calls
+    registered_at = Column(DateTime, default=datetime.utcnow)
+    last_seen = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class Device(Base):
+    __tablename__ = "devices"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(String(200), index=True, nullable=False)
+    device_token = Column(String(1024), nullable=False)
+    platform = Column(String(50), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    __table_args__ = (UniqueConstraint("user_id", "device_token", name="u_user_device"),)
+
+class UserCityHash(Base):
+    __tablename__ = "user_city_hash"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(String(200), index=True, nullable=False)
+    city = Column(String(200), index=True, nullable=False)
+    last_hash = Column(String(128), nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    __table_args__ = (UniqueConstraint("user_id", "city", name="u_user_city"),)
+
+Base.metadata.create_all(bind=engine)
+
+# -----------------------
+# App + utilities
+# -----------------------
+app = Flask(__name__)
+geolocator = Nominatim(user_agent="local-news-agent")
+
+# City cache: city -> {"data": {..}, "timestamp": epoch_seconds}
+NEWS_CACHE = {}
+# Optionally you can maintain a separate hash cache for headlines to avoid re-hashing
+# But we'll compute per fetch
+# -----------------------
+# AES helpers
+# -----------------------
+def generate_aes_b64():
+    return base64.b64encode(os.urandom(32)).decode()
+
+def aes_gcm_encrypt_with_key_bytes(key_bytes: bytes, plaintext_bytes: bytes) -> str:
+    nonce = get_random_bytes(12)
+    cipher = AES.new(key_bytes, AES.MODE_GCM, nonce=nonce)
+    ciphertext, tag = cipher.encrypt_and_digest(plaintext_bytes)
+    packed = nonce + ciphertext + tag
+    return base64.b64encode(packed).decode()
+
+def aes_gcm_encrypt_with_key_b64(key_b64: str, plaintext_str: str) -> str:
+    key = base64.b64decode(key_b64)
+    return aes_gcm_encrypt_with_key_bytes(key, plaintext_str.encode("utf-8"))
+
+# -----------------------
+# News fetching + summarization + classification
+# -----------------------
+def reverse_geocode_city(lat: float, lon: float) -> str:
+    try:
+        loc = geolocator.reverse(f"{lat}, {lon}", exactly_one=True, language="en")
+        if not loc:
+            return None
+        addr = loc.raw.get("address", {})
+        return addr.get("city") or addr.get("town") or addr.get("village") or addr.get("state") or addr.get("country")
+    except Exception:
+        return None
+
+def fetch_news_for_city(city: str, max_items: int = 5):
+    try:
+        q = requests.utils.quote(city)
+        url = f"https://news.google.com/rss/search?q={q}&hl=en-IN&gl=IN&ceid=IN:en"
+        r = requests.get(url, timeout=10)
+        feed = feedparser.parse(r.content)
+        results = []
+        for entry in feed.entries[:max_items]:
+            results.append({
+                "title": entry.get("title", ""),
+                "summary": entry.get("summary", "")
+            })
+        return results
+    except Exception:
+        return []
+
+def summarize_with_gemini(text: str) -> str:
+    try:
+        model = genai.GenerativeModel("gemini-pro")
+        prompt = f"Summarize the following news content into 2-3 concise lines suitable for a mobile user:\n\n{text}"
+        resp = model.generate_content(prompt)
+        return (resp.text or "").strip()
+    except Exception:
+        # fallback simple trim
+        return text[:400] + ("..." if len(text) > 400 else "")
+
+def classify_priority_for_city(text: str, city: str) -> str:
+    """
+    Returns "HIGH" or "LOW" indicating whether the given text is high priority for city.
+    """
+    try:
+        model = genai.GenerativeModel("gemini-pro")
+        prompt = f"""
+You are an assistant classifying whether the following news item is HIGH priority for people living in the city: {city}.
+
+HIGH priority examples:
+- Disasters, floods, storms, earthquakes, fires, major accidents
+- City-specific government or police alerts
+- Health emergencies, power outages, traffic blockages affecting city mobility
+- Any event expected to affect safety, health or daily life of residents in {city}
+
+LOW priority examples:
+- Entertainment, sports, routine business news, political debate without local impact
+- News clearly about another city or region not affecting {city}
+
+Only respond with HIGH or LOW.
+
+News:
+{text}
+"""
+        resp = model.generate_content(prompt)
+        out = (resp.text or "").strip().upper()
+        return "HIGH" if "HIGH" in out else "LOW"
+    except Exception:
+        # default LOW on error to avoid spamming users
+        return "LOW"
+
+def compute_news_hash(items):
+    s = "\n".join(it['title'] for it in items)
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+# -----------------------
+# Push helper (Firebase)
+# -----------------------
+def send_push_to_token(token: str, title: str, body: str, data_payload: dict = None):
+    if not token:
+        return None
+    message = messaging.Message(
+        notification=messaging.Notification(title=title, body=body),
+        token=token,
+        android=messaging.AndroidConfig(priority="high"),
+        data=data_payload or {}
+    )
+    resp = messaging.send(message)
+    return resp
+
+# -----------------------
+# DB helpers
+# -----------------------
+def get_user(session, user_id: str):
+    return session.query(User).filter_by(user_id=user_id).first()
+
+def create_user(session, user_id: str, device_id=None, device_token=None, name=None, language="en"):
+    key_b64 = generate_aes_b64()
+    user = User(
+        user_id=user_id,
+        aes_key_b64=key_b64,
+        device_id=device_id,
+        device_token=device_token,
+        name=name,
+        language=language,
+        city=None
+    )
+    session.add(user)
+    session.commit()
+    session.refresh(user)
+    return user
+
+def upsert_device(session, user_id: str, device_token: str, platform: str = "android"):
+    existing = session.query(Device).filter_by(user_id=user_id, device_token=device_token).first()
+    if existing:
+        return existing
+    d = Device(user_id=user_id, device_token=device_token, platform=platform)
+    session.add(d)
+    session.commit()
+    return d
+
+def upsert_user_city_hash(session, user_id: str, city: str, new_hash: str):
+    uch = session.query(UserCityHash).filter_by(user_id=user_id, city=city).first()
+    if not uch:
+        uch = UserCityHash(user_id=user_id, city=city, last_hash=new_hash)
+        session.add(uch)
+    else:
+        uch.last_hash = new_hash
+    session.commit()
+    return uch
+
+# -----------------------
+# Endpoints
+# -----------------------
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"})
+
+@app.route("/sync", methods=["POST"])
+def sync():
+    """
+    Body: { "user_id": "...", "device_id": "...", "device_token": "...", "name": "...", "language": "en" }
+    Response: { "encrypted_user_key": "<base64(nonce+ciphertext+tag)>" }
+    The encrypted_user_key is the user's AES key (base64 string) encrypted with the AppCommonKey (server-side).
+    """
+    try:
+        data = request.get_json(force=True) or {}
+        user_id = data.get("user_id")
+        device_id = data.get("device_id")
+        device_token = data.get("device_token")
+        name = data.get("name")
+        language = data.get("language", "en")
+
+        if not user_id:
+            return jsonify({"error": "user_id required"}), 400
+
+        with SessionLocal() as session:
+            user = get_user(session, user_id)
+            if not user:
+                user = create_user(session, user_id, device_id=device_id, device_token=device_token, name=name, language=language)
+            else:
+                # update device info and metadata
+                user.device_id = device_id or user.device_id
+                user.device_token = device_token or user.device_token
+                user.name = name or user.name
+                user.language = language or user.language
+                user.last_seen = datetime.utcnow()
+                session.commit()
+
+            # upsert device table
+            if device_token:
+                upsert_device(session, user_id, device_token)
+
+            # encrypt the user's AES key (which itself is base64) with AppCommonKey
+            encrypted_user_key = aes_gcm_encrypt_with_key_bytes(APPCOMMON_KEY_BYTES, user.aes_key_b64.encode("utf-8"))
+
+            return jsonify({"encrypted_user_key": encrypted_user_key, "message": "synced"}), 200
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": "internal", "detail": str(e)}), 500
+
+@app.route("/register_device", methods=["POST"])
+def register_device():
+    """
+    Body: {"user_id": "...", "device_token": "...", "platform": "android"}
+    """
+    try:
+        data = request.get_json(force=True) or {}
+        user_id = data.get("user_id")
+        token = data.get("device_token")
+        platform = data.get("platform", "android")
+        if not user_id or not token:
+            return jsonify({"error":"user_id and device_token required"}), 400
+
+        with SessionLocal() as session:
+            upsert_device(session, user_id, token, platform)
+            # also update user table device_token for convenience
+            user = get_user(session, user_id)
+            if user:
+                user.device_token = token
+                session.commit()
+        return jsonify({"ok": True})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": "internal"}), 500
+
+@app.route("/news", methods=["POST"])
+def news():
+    """
+    Body:
+      { "user_id": "...", "lat": 12.34, "lon": 56.78, "max_items": 5 (optional) }
+
+    Response:
+      { "data": "<base64 nonce+ciphertext+tag>" }
+    """
+    try:
+        payload = request.get_json(force=True) or {}
+        user_id = payload.get("user_id")
+        lat = payload.get("lat")
+        lon = payload.get("lon")
+        max_items = int(payload.get("max_items", 5))
+
+        if not user_id:
+            return jsonify({"error": "user_id required"}), 400
+        if lat is None or lon is None:
+            return jsonify({"error": "lat and lon required"}), 400
+
+        with SessionLocal() as session:
+            user = get_user(session, user_id)
+            if not user:
+                return jsonify({"error": "user not found; sync first"}), 400
+
+            # resolve city (update user city)
+            city = reverse_geocode_city(float(lat), float(lon)) or "your area"
+            user.city = city
+            user.last_seen = datetime.utcnow()
+            session.commit()
+            user_key_b64 = user.aes_key_b64
+
+        # Check cache first
+        now = time.time()
+        cached = NEWS_CACHE.get(city)
+        if cached and now - cached["timestamp"] < CACHE_TTL:
+            result = cached["data"]
+        else:
+            # fetch & summarize
+            entries = fetch_news_for_city(city, max_items=max_items)
+            clean_list = []
+            for e in entries:
+                combined = f"{e['title']}\n{e['summary']}"
+                summary = summarize_with_gemini(combined)
+                clean_list.append({"headline": e['title'], "summary": summary})
+            result = {"city": city, "news": clean_list, "fetched_at": datetime.utcnow(timezone.utc).isoformat()}
+            NEWS_CACHE[city] = {"data": result, "timestamp": now}
+
+        # encrypt with user's key
+        encrypted = aes_gcm_encrypt_with_key_b64(user_key_b64, json.dumps(result, ensure_ascii=False))
+        return jsonify({"data": encrypted})
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": "internal", "detail": str(e)}), 500
+
+# Protected cron endpoint (Render cron should POST with header X-Cron-Secret)
+@app.route("/cron/check-news", methods=["POST"])
+def cron_check_news():
+    """
+    This endpoint should be triggered by Render Scheduled Job (HTTP POST every N minutes)
+    Protect with header: X-Cron-Secret: <CRON_SECRET>
+    """
+    try:
+        secret = request.headers.get("X-Cron-Secret")
+        if not secret or secret != CRON_SECRET:
+            return jsonify({"error": "unauthorized"}), 401
+
+        # Build mapping: city -> list of users (user objects)
+        with SessionLocal() as session:
+            users = session.query(User).filter(User.city.isnot(None)).all()
+            city_groups = {}
+            for u in users:
+                city_groups.setdefault(u.city, []).append(u)
+
+        # For each city, ensure cached summary exists (fetch if expired)
+        for city, user_list in city_groups.items():
+            now = time.time()
+            cached = NEWS_CACHE.get(city)
+            if not cached or now - cached["timestamp"] >= CACHE_TTL:
+                entries = fetch_news_for_city(city, max_items=5)
+                summarized_list = []
+                for e in entries:
+                    combined = f"{e['title']}\n{e['summary']}"
+                    summary_text = summarize_with_gemini(combined)
+                    summarized_list.append({"title": e['title'], "summary": summary_text})
+                result = {"city": city, "news": summarized_list, "fetched_at": datetime.utcnow(timezone.utc).isoformat()}
+                NEWS_CACHE[city] = {"data": result, "timestamp": now}
+            else:
+                result = cached["data"]
+
+            # Compute a hash based on headlines to detect new news
+            items_for_hash = [{"title": it["title"]} for it in result["news"]]
+            new_hash = compute_news_hash(items_for_hash)
+
+            # For each user in this city, check their last hash and notify if changed (and priority HIGH)
+            for user in user_list:
+                with SessionLocal() as session:
+                    uch = session.query(UserCityHash).filter_by(user_id=user.user_id, city=city).first()
+                    previous_hash = uch.last_hash if uch else None
+
+                    # if same hash, nothing new for that user
+                    if previous_hash == new_hash:
+                        continue
+
+                    # classify priority for the city based on concatenated news text (we can classify per item or per city; choose per item if needed)
+                    # We'll check top N items and notify only if at least one item is HIGH
+                    high_items = []
+                    for it in result["news"]:
+                        text_for_class = f"{it['headline']}\n{it['summary']}"
+                        priority = classify_priority_for_city(text_for_class, city)
+                        if priority == "HIGH":
+                            high_items.append(it)
+
+                    # If no high-priority items, skip notification for this user
+                    if not high_items:
+                        # still update hash so user won't be rechecked for same headlines repeatedly
+                        if uch:
+                            uch.last_hash = new_hash
+                            session.commit()
+                        else:
+                            upsert_user_city_hash(session, user.user_id, city, new_hash)
+                        continue
+
+                    # update or create user city hash
+                    if uch:
+                        uch.last_hash = new_hash
+                        session.commit()
+                    else:
+                        upsert_user_city_hash(session, user.user_id, city, new_hash)
+
+                    # Prepare payload: we will include only high_items in payload
+                    payload = {"city": city, "high_priority": high_items, "fetched_at": result["fetched_at"]}
+
+                    # Encrypt per-user payload with their AES key
+                    encrypted_payload = aes_gcm_encrypt_with_key_b64(user.aes_key_b64, json.dumps(payload, ensure_ascii=False))
+
+                    # Send push to all devices of this user
+                    # get user's devices from Device table
+                    with SessionLocal() as ds:
+                        devices = ds.query(Device).filter_by(user_id=user.user_id).all()
+                        for dev in devices:
+                            token = dev.device_token
+                            title = f"Important update in {city}"
+                            body = high_items[0]["headline"] if high_items else f"Important news in {city}"
+                            try:
+                                send_push_to_token(token, title, body, data_payload={"enc": encrypted_payload})
+                            except Exception as e:
+                                print("Push send error:", e)
+
+        return jsonify({"ok": True})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": "internal", "detail": str(e)}), 500
+    
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+# -----------------------
+# Run
+# -----------------------
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
